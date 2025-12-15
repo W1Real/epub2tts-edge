@@ -349,24 +349,28 @@ def make_m4b(files, sourcefile, speaker):
         outputm4a,
     ]
     subprocess.run(ffmpeg_command)
+    
+    # Second pass: Encode to final format (Opus/AAC) + Chapters
+    print(f"Encoding final file with {codec} at {bitrate}...")
     ffmpeg_command = [
         "ffmpeg",
-        "-i",
-        outputm4a,
-        "-i",
-        "FFMETADATAFILE",
-        "-map_metadata",
-        "1",
-        "-codec",
-        "aac",
+        "-i", outputm4a,
+        "-i", "FFMETADATAFILE",
+        "-map_metadata", "1",
+        "-c:a", codec,     # Use the selected codec
+        "-b:a", bitrate,   # Use the selected bitrate
+        "-y",              # Overwrite if exists
         outputm4b,
     ]
     subprocess.run(ffmpeg_command)
-    os.remove(filelist)
-    os.remove("FFMETADATAFILE")
-    os.remove(outputm4a)
+    
+    # Cleanup
+    if os.path.exists(filelist): os.remove(filelist)
+    if os.path.exists("FFMETADATAFILE"): os.remove("FFMETADATAFILE")
+    if os.path.exists(outputm4a): os.remove(outputm4a)
     for f in files:
-        os.remove(f)
+        if os.path.exists(f): os.remove(f)
+        
     return outputm4b
 
 def add_cover(cover_img, filename):
@@ -378,8 +382,8 @@ def add_cover(cover_img, filename):
             m4b.save()
         else:
             print(f"Cover image {cover_img} not found")
-    except:
-        print(f"Cover image {cover_img} not found")
+    except Exception as e:
+        print(f"Could not add cover image: {e}")
 
 def run_edgespeak(sentence, speaker, filename):
     for speakattempt in range(3):
@@ -387,7 +391,7 @@ def run_edgespeak(sentence, speaker, filename):
             communicate = edge_tts.Communicate(sentence, speaker)
             run_save(communicate, filename)
             if os.path.getsize(filename) == 0:
-                raise Exception("Failed to save file from edge_tts") from e
+                raise Exception("Failed to save file from edge_tts")
             break
         except Exception as e:
             print(f"Attempt {speakattempt+1}/3 failed with '{sentence}' in run_edgespeak with error: {e}")
@@ -446,6 +450,19 @@ def main():
         default=1200,
         help="duration of pause after paragraph, in milliseconds (default: 1200)"
     )
+    # MODIFIED: Added arguments for codec and bitrate
+    parser.add_argument(
+        "--codec",
+        type=str,
+        default="libopus",
+        help="Audio codec to use (default: libopus). Try 'aac' for better Apple compatibility."
+    )
+    parser.add_argument(
+        "--bitrate",
+        type=str,
+        default="35k",
+        help="Target bitrate for the audio encoding (default: 35k)"
+    )
 
 
     args = parser.parse_args()
@@ -462,7 +479,9 @@ def main():
     book_contents, book_title, book_author, chapter_titles = get_book(args.sourcefile)
     files = read_book(book_contents, args.speaker, args.paragraphpause, args.sentencepause)
     generate_metadata(files, book_author, book_title, chapter_titles)
-    m4bfilename = make_m4b(files, args.sourcefile, args.speaker)
+    
+    m4bfilename = make_m4b(files, args.sourcefile, args.speaker, args.codec, args.bitrate)
+    
     add_cover(args.cover, m4bfilename)
 
 
