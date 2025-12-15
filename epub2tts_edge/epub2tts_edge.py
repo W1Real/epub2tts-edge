@@ -323,7 +323,7 @@ def get_duration(file_path):
     duration_milliseconds = len(audio)
     return duration_milliseconds
 
-def make_m4b(files, sourcefile, speaker):
+def make_m4b(files, sourcefile, speaker, codec, bitrate):
     filelist = "filelist.txt"
     basefile = sourcefile.replace(".txt", "")
     outputm4a = f"{basefile} ({speaker}).m4a"
@@ -332,6 +332,8 @@ def make_m4b(files, sourcefile, speaker):
         for filename in files:
             filename = filename.replace("'", "'\\''")
             f.write(f"file '{filename}'\n")
+            
+    # First pass: concat to temp file
     ffmpeg_command = [
         "ffmpeg",
         "-f",
