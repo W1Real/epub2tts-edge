@@ -20,11 +20,6 @@ from PIL import Image
 from pydub import AudioSegment
 import zipfile
 
-# AI Summary: Main script for converting ePub/text to audiobook.
-# Handles text extraction, TTS generation (EdgeTTS), and audio assembly (FFmpeg).
-# Uses Matroska (.mka) container for robust support of Opus/Chapters/Cover Art.
-# Includes Mojibake cleaning and Azure rate-limit survival logic.
-
 namespaces = {
    "calibre":"http://calibre.kovidgoyal.net/2009/metadata",
    "dc":"http://purl.org/dc/elements/1.1/",
@@ -46,42 +41,28 @@ def ensure_punkt():
     except LookupError:
         nltk.download("punkt_tab")
 
-def fix_mojibake(text):
-    """
-    Cleans up common Windows-1252 to UTF-8 decoding errors often found in EPUBs.
-    """
-    replacements = {
-        "â€”": "—",  # em dash
-        "â€“": "–",  # en dash
-        "â€™": "'",  # right single quote
-        "â€˜": "'",  # left single quote
-        "â€œ": '"',  # left double quote
-        "â€\x9d": '"', # right double quote (various byte artifacts)
-        "â€": '"',   # generic double quote catch
-        "Ã©": "é",  # e acute
-        "Ã¨": "è",  # e grave
-        "Ã": "à"    # a grave
-    }
-    for bad, good in replacements.items():
-        text = text.replace(bad, good)
-    return text
-
-def chap2text_epub(chap):
+def chap2text_epub(chap, encoding="utf-8"):
     blacklist = ["[document]", "noscript", "header", "html", "meta", "head", "input", "script"]
     paragraphs = []
     
-    # Force decoding to utf-8 if possible to prevent initial Mojibake
+    # ---------------------------------------------------------
+    # THE ENCODING FIX:
+    # Intercept raw bytes and force decode them BEFORE BeautifulSoup 
+    # can ruin them with bad guesses.
+    # ---------------------------------------------------------
     if isinstance(chap, bytes):
-        chap = chap.decode('utf-8', errors='ignore')
-        
+        try:
+            chap = chap.decode(encoding)
+        except UnicodeDecodeError:
+            print(f"\n⚠️ WARNING: Failed to decode chapter using '{encoding}'. Falling back to utf-8 with error replacement.")
+            chap = chap.decode('utf-8', errors='replace')
+            
     soup = BeautifulSoup(chap, "html.parser")
     
-    # More robust HTML title fallback: Check h1, then h2, then the document <title>
+    # More robust HTML title fallback
     chapter_title = soup.find("h1")
-    if not chapter_title:
-        chapter_title = soup.find("h2")
-    if not chapter_title:
-        chapter_title = soup.find("title")
+    if not chapter_title: chapter_title = soup.find("h2")
+    if not chapter_title: chapter_title = soup.find("title")
         
     if chapter_title and chapter_title.text.strip():
         chapter_title_text = chapter_title.text.strip()
@@ -123,7 +104,7 @@ def get_epub_cover(epub_path):
     except FileNotFoundError:
         print(f"Could not get cover image of {epub_path}")
 
-def export(book, sourcefile):
+def export(book, sourcefile, encoding="utf-8"):
     book_contents = []
     cover_image = get_epub_cover(sourcefile)
     
@@ -135,25 +116,21 @@ def export(book, sourcefile):
     else:
         print("No cover found in epub.")
 
-    # --- NEW: PARSE THE TOC.NCX FOR REAL CHAPTER TITLES ---
+    # Parse TOC.NCX for real chapter titles
     toc_map = {}
     for item in book.get_items():
         if type(item) == ebooklib.epub.EpubNcx:
             try:
-                # Parse the NCX file to map HTML filenames to actual Chapter Titles
                 ncx_soup = BeautifulSoup(item.get_content(), "html.parser")
                 for nav in ncx_soup.find_all("navpoint"):
                     text_node = nav.find("text")
                     content_node = nav.find("content")
                     if text_node and content_node and content_node.get("src"):
-                        # Remove anchor links (e.g., text/part0006.html#5N3C0 -> text/part0006.html)
                         src = content_node.get("src").split("#")[0]
-                        # Only grab the first navPoint for a file to avoid overwriting chapter titles with sub-headers
                         if src not in toc_map:
                             toc_map[src] = text_node.text.strip()
             except Exception as e:
                 print(f"Warning: Failed to parse NCX TOC: {e}")
-    # ------------------------------------------------------
 
     spine_ids = []
     for spine_tuple in book.spine:
@@ -170,22 +147,18 @@ def export(book, sourcefile):
         if item is None:
             continue
             
-        # Get fallback title and paragraphs from HTML
-        html_title, chapter_paragraphs = chap2text_epub(item.get_content())
+        html_title, chapter_paragraphs = chap2text_epub(item.get_content(), encoding)
         
-        # Determine the final chapter title (Prioritize TOC.NCX over HTML)
         chapter_title = None
         if item.file_name in toc_map:
             chapter_title = toc_map[item.file_name]
         else:
-            # Fallback: check just the base file name (e.g. part0006.html without the 'text/' folder)
             base_name = os.path.basename(item.file_name)
             for toc_src, toc_title in toc_map.items():
                 if os.path.basename(toc_src) == base_name:
                     chapter_title = toc_title
                     break
                     
-        # If TOC didn't have it, use the HTML title. If HTML didn't have it, it becomes None.
         if not chapter_title:
             chapter_title = html_title
 
@@ -193,7 +166,7 @@ def export(book, sourcefile):
         
     outfile = sourcefile.replace(".epub", ".txt")
     check_for_file(outfile)
-    print(f"Exporting {sourcefile} to {outfile}")
+    print(f"Exporting {sourcefile} to {outfile} using encoding: {encoding}")
     
     author = book.get_metadata("DC", "creator")[0][0]
     booktitle = book.get_metadata("DC", "title")[0][0]
@@ -214,17 +187,18 @@ def export(book, sourcefile):
                     file.write(f"# {chapter['title']}\n\n")
                 for paragraph in chapter["paragraphs"]:
                     clean = re.sub(r'[\s\n]+', ' ', paragraph)
-                    clean = fix_mojibake(clean)
                     clean = re.sub(r'[“”]', '"', clean)
                     clean = re.sub(r'[‘’]', "'", clean)
                     file.write(f"{clean}\n\n")
 
-def get_book(sourcefile):
+def get_book(sourcefile, encoding="utf-8"):
     book_contents = []
     book_title = sourcefile
     book_author = "Unknown"
     chapter_titles = []
-    with open(sourcefile, "r", encoding="utf-8") as file:
+    
+    # Text reader now also respects the user's encoding choice
+    with open(sourcefile, "r", encoding=encoding, errors="replace") as file:
         current_chapter = {"title": "blank", "paragraphs": []}
         initialized_first_chapter = False
         lines_skipped = 0
@@ -237,7 +211,7 @@ def get_book(sourcefile):
                     book_author = line.replace('Author: ', '').strip()
                 continue
             
-            line = fix_mojibake(line.strip()) # Apply mojibake fix on read
+            line = line.strip()
             
             if line.startswith("#"):
                 if current_chapter["paragraphs"] or not initialized_first_chapter:
@@ -314,7 +288,6 @@ def read_book(book_contents, speaker, paragraphpause, sentencepause):
                     speakers = [speaker] * len(sentences)
                     asyncio.run(parallel_edgespeak(sentences, speakers, filenames))
                     
-                    # Ensure the last file actually exists before appending silence
                     if os.path.exists(filenames[-1]):
                         append_silence(filenames[-1], paragraphpause)
                         
@@ -323,7 +296,7 @@ def read_book(book_contents, speaker, paragraphpause, sentencepause):
                         sorted_files.insert(0, "sntnc0.mp3")
                     combined = AudioSegment.empty()
                     for file in sorted_files:
-                        if os.path.exists(file): # Extra safety check
+                        if os.path.exists(file): 
                             combined += AudioSegment.from_file(file)
                     combined.export(ptemp, format="flac")
                     for file in sorted_files:
@@ -331,7 +304,6 @@ def read_book(book_contents, speaker, paragraphpause, sentencepause):
                             os.remove(file)
                 files.append(ptemp)
             
-            # Ensure the segment actually generated files
             if files and os.path.exists(files[-1]):
                 append_silence(files[-1], 2000)
             
@@ -349,7 +321,7 @@ def read_book(book_contents, speaker, paragraphpause, sentencepause):
 def generate_metadata(files, author, title, chapter_titles):
     chap = 0
     start_time = 0
-    with open("FFMETADATAFILE", "w") as file:
+    with open("FFMETADATAFILE", "w", encoding='utf-8') as file:
         file.write(";FFMETADATA1\n")
         file.write(f"ARTIST={author}\n")
         file.write(f"ALBUM={title}\n")
@@ -373,10 +345,9 @@ def make_audiobook(files, sourcefile, speaker, codec, bitrate, cover_img):
     filelist = "filelist.txt"
     basefile = sourcefile.replace(".txt", "")
     output_intermediate_flac = f"{basefile}_temp.flac"
-    
     output_final = f"{basefile} ({speaker}).mka"
     
-    with open(filelist, "w") as f:
+    with open(filelist, "w", encoding='utf-8') as f:
         for filename in files:
             filename = filename.replace("'", "'\\''")
             f.write(f"file '{filename}'\n")
@@ -427,7 +398,6 @@ def make_audiobook(files, sourcefile, speaker, codec, bitrate, cover_img):
     return output_final
 
 def run_edgespeak(sentence, speaker, filename):
-    # Try up to 5 times instead of 3, using exponential backoff to handle Azure API rate limits
     for speakattempt in range(5):
         try:
             communicate = edge_tts.Communicate(sentence, speaker)
@@ -436,10 +406,8 @@ def run_edgespeak(sentence, speaker, filename):
                 raise Exception("Failed to save file from edge_tts")
             break
         except Exception as e:
-            # Backoff to avoid Azure blocking the IP: 3s, 5s, 7s...
             time.sleep(3 + (speakattempt * 2))
     else:
-        # DO NOT `exit()` ! If a sentence fails, insert silence instead of killing a 5-hour render.
         print(f"\n⚠️ WARNING: Giving up on sentence '{sentence[:50]}...'. Replacing with 1-second silence.")
         try:
             silence = AudioSegment.silent(duration=1000)
@@ -451,8 +419,6 @@ def run_save(communicate, filename):
     asyncio.run(communicate.save(filename))
 
 async def parallel_edgespeak(sentences, speakers, filenames):
-    # Dropped Semaphore from 10 to 5. 
-    # Edge-TTS is an undocumented API; 10 parallel connections triggers aggressive rate limiting.
     semaphore = asyncio.Semaphore(5)
     with concurrent.futures.ThreadPoolExecutor() as executor:
         tasks = []
@@ -474,6 +440,7 @@ def main():
     parser.add_argument("--paragraphpause", type=int, default=1200)
     parser.add_argument("--codec", type=str, default="libopus", help="Audio codec (default: libopus)")
     parser.add_argument("--bitrate", type=str, default="35k", help="Bitrate (default: 35k)")
+    parser.add_argument("--encoding", type=str, default="utf-8", help="Force text encoding (default: utf-8). Useful for fixing Mojibake.")
 
     args = parser.parse_args()
     print(args)
@@ -482,14 +449,13 @@ def main():
 
     if args.sourcefile.endswith(".epub"):
         book = epub.read_epub(args.sourcefile)
-        export(book, args.sourcefile)
-        # Check if auto-generated cover exists and set it if args.cover wasn't provided
+        export(book, args.sourcefile, encoding=args.encoding)
         auto_cover = args.sourcefile.replace(".epub", ".png")
         if args.cover is None and os.path.exists(auto_cover):
              args.cover = auto_cover
         exit()
 
-    book_contents, book_title, book_author, chapter_titles = get_book(args.sourcefile)
+    book_contents, book_title, book_author, chapter_titles = get_book(args.sourcefile, encoding=args.encoding)
     files = read_book(book_contents, args.speaker, args.paragraphpause, args.sentencepause)
     generate_metadata(files, book_author, book_title, chapter_titles)
     
