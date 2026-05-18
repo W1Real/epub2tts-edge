@@ -258,7 +258,7 @@ def append_silence(tempfile, duration=1200):
     combined = audio + silence
     combined.export(tempfile, format="flac")
 
-def read_book(book_contents, speaker, paragraphpause, sentencepause, failed_sentences):
+def read_book(book_contents, speaker, paragraphpause, sentencepause, failed_sentences, concurrency):
     segments = []
     title_names_to_skip_reading = ['Title', 'blank']
     for i, chapter in enumerate(book_contents, start=1):
@@ -276,7 +276,8 @@ def read_book(book_contents, speaker, paragraphpause, sentencepause, failed_sent
             if chapter["title"] == "":
                 chapter["title"] = "blank"
             if chapter["title"] not in title_names_to_skip_reading:
-                asyncio.run(parallel_edgespeak([chapter["title"]], [speaker], ["sntnc0.mp3"], failed_sentences))
+                # Pass concurrency down
+                asyncio.run(parallel_edgespeak([chapter["title"]], [speaker], ["sntnc0.mp3"], failed_sentences, concurrency))
                 append_silence("sntnc0.mp3", 1200)
             for pindex, paragraph in enumerate(tqdm(chapter["paragraphs"], desc=f"Generating audio files: ",unit='pg')):
                 ptemp = f"pgraphs{pindex}.flac"
@@ -287,8 +288,8 @@ def read_book(book_contents, speaker, paragraphpause, sentencepause, failed_sent
                     filenames = ["sntnc" + str(z + 1) + ".mp3" for z in range(len(sentences))]
                     speakers = [speaker] * len(sentences)
                     
-                    # Pass the tracking list into the parallel generator
-                    asyncio.run(parallel_edgespeak(sentences, speakers, filenames, failed_sentences))
+                    # Pass concurrency down
+                    asyncio.run(parallel_edgespeak(sentences, speakers, filenames, failed_sentences, concurrency))
                     
                     if os.path.exists(filenames[-1]):
                         append_silence(filenames[-1], paragraphpause)
@@ -319,6 +320,7 @@ def read_book(book_contents, speaker, paragraphpause, sentencepause, failed_sent
                     os.remove(file)
             segments.append(partname)
     return segments
+
 
 def generate_metadata(files, author, title, chapter_titles):
     chap = 0
@@ -427,8 +429,9 @@ async def run_edgespeak(sentence, speaker, filename, failed_sentences):
 def run_save(communicate, filename):
     asyncio.run(communicate.save(filename))
 
-async def parallel_edgespeak(sentences, speakers, filenames, failed_sentences):
-    semaphore = asyncio.Semaphore(5) # Keeps Azure from IP-banning you
+async def parallel_edgespeak(sentences, speakers, filenames, failed_sentences, concurrency):
+    # Uses the user-defined concurrency limit (defaults to 5)
+    semaphore = asyncio.Semaphore(concurrency) 
     
     async def bounded_edgespeak(sentence, speaker, filename):
         async with semaphore:
@@ -445,13 +448,16 @@ async def parallel_edgespeak(sentences, speakers, filenames, failed_sentences):
 def main():
     parser = argparse.ArgumentParser(prog="epub2tts-edge")
     parser.add_argument("sourcefile", type=str, help="The epub or text file to process")
-    parser.add_argument("--speaker", type=str, default="en-US-AndrewNeural")
+    parser.add_argument("--speaker", type=str, default="en-US-AvaNeural")
     parser.add_argument("--cover", type=str, help="jpg image to use for cover")
-    parser.add_argument("--sentencepause", type=int, default=1200)
-    parser.add_argument("--paragraphpause", type=int, default=1200)
+    parser.add_argument("--sentencepause", type=int, default=70)
+    parser.add_argument("--paragraphpause", type=int, default=200)
     parser.add_argument("--codec", type=str, default="libopus", help="Audio codec (default: libopus)")
     parser.add_argument("--bitrate", type=str, default="35k", help="Bitrate (default: 35k)")
     parser.add_argument("--encoding", type=str, default="utf-8", help="Force text encoding (default: utf-8). Useful for fixing Mojibake.")
+    
+    # NEW ARGUMENT: Let the user push the API as hard as they want
+    parser.add_argument("--concurrency", type=int, default=5, help="Number of concurrent TTS requests to Azure (default: 5)")
 
     args = parser.parse_args()
     print(args)
@@ -468,16 +474,15 @@ def main():
 
     book_contents, book_title, book_author, chapter_titles = get_book(args.sourcefile, encoding=args.encoding)
     
-    # Initialize the tracking list
     failed_sentences = []
     
-    files = read_book(book_contents, args.speaker, args.paragraphpause, args.sentencepause, failed_sentences)
+    # Pass the new concurrency arg into read_book
+    files = read_book(book_contents, args.speaker, args.paragraphpause, args.sentencepause, failed_sentences, args.concurrency)
     generate_metadata(files, book_author, book_title, chapter_titles)
     
     final_file = make_audiobook(files, args.sourcefile, args.speaker, args.codec, args.bitrate, args.cover)
     print(f"Done! File saved as: {final_file}")
 
-    # Courtesy Summary printed at the very end
     if failed_sentences:
         print("\n" + "="*80)
         print("⚠️  CONVERSION COMPLETED, BUT SOME SENTENCES FAILED ⚠️")
