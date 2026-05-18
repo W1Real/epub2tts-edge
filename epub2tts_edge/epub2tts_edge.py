@@ -258,7 +258,7 @@ def append_silence(tempfile, duration=1200):
     combined = audio + silence
     combined.export(tempfile, format="flac")
 
-def read_book(book_contents, speaker, paragraphpause, sentencepause):
+def read_book(book_contents, speaker, paragraphpause, sentencepause, failed_sentences):
     segments = []
     title_names_to_skip_reading = ['Title', 'blank']
     for i, chapter in enumerate(book_contents, start=1):
@@ -276,7 +276,7 @@ def read_book(book_contents, speaker, paragraphpause, sentencepause):
             if chapter["title"] == "":
                 chapter["title"] = "blank"
             if chapter["title"] not in title_names_to_skip_reading:
-                asyncio.run(parallel_edgespeak([chapter["title"]], [speaker], ["sntnc0.mp3"]))
+                asyncio.run(parallel_edgespeak([chapter["title"]], [speaker], ["sntnc0.mp3"], failed_sentences))
                 append_silence("sntnc0.mp3", 1200)
             for pindex, paragraph in enumerate(tqdm(chapter["paragraphs"], desc=f"Generating audio files: ",unit='pg')):
                 ptemp = f"pgraphs{pindex}.flac"
@@ -286,7 +286,9 @@ def read_book(book_contents, speaker, paragraphpause, sentencepause):
                     sentences = sent_tokenize(paragraph)
                     filenames = ["sntnc" + str(z + 1) + ".mp3" for z in range(len(sentences))]
                     speakers = [speaker] * len(sentences)
-                    asyncio.run(parallel_edgespeak(sentences, speakers, filenames))
+                    
+                    # Pass the tracking list into the parallel generator
+                    asyncio.run(parallel_edgespeak(sentences, speakers, filenames, failed_sentences))
                     
                     if os.path.exists(filenames[-1]):
                         append_silence(filenames[-1], paragraphpause)
@@ -397,18 +399,25 @@ def make_audiobook(files, sourcefile, speaker, codec, bitrate, cover_img):
 
     return output_final
 
-def run_edgespeak(sentence, speaker, filename):
+async def run_edgespeak(sentence, speaker, filename, failed_sentences):
+    # Native async function: much faster and less resource intensive
     for speakattempt in range(5):
         try:
             communicate = edge_tts.Communicate(sentence, speaker)
-            run_save(communicate, filename)
+            await communicate.save(filename) 
+            
             if not os.path.exists(filename) or os.path.getsize(filename) == 0:
                 raise Exception("Failed to save file from edge_tts")
             break
         except Exception as e:
-            time.sleep(3 + (speakattempt * 2))
+            # Non-blocking pause. Doesn't freeze the CPU like time.sleep()
+            await asyncio.sleep(2 + speakattempt)
     else:
-        print(f"\n⚠️ WARNING: Giving up on sentence '{sentence[:50]}...'. Replacing with 1-second silence.")
+        print(f"\n⚠️ WARNING: Giving up on sentence '{sentence[:50]}...'. Replacing with silence.")
+        
+        # Add the failed sentence to our tracking list
+        failed_sentences.append(sentence)
+        
         try:
             silence = AudioSegment.silent(duration=1000)
             silence.export(filename, format="mp3")
@@ -418,18 +427,20 @@ def run_edgespeak(sentence, speaker, filename):
 def run_save(communicate, filename):
     asyncio.run(communicate.save(filename))
 
-async def parallel_edgespeak(sentences, speakers, filenames):
-    semaphore = asyncio.Semaphore(5)
-    with concurrent.futures.ThreadPoolExecutor() as executor:
-        tasks = []
-        for sentence, speaker, filename in zip(sentences, speakers, filenames):
-            async with semaphore:
-                loop = asyncio.get_running_loop()
-                sentence = re.sub(r'[!]+', '!', sentence)
-                sentence = re.sub(r'[?]+', '?', sentence)
-                task = loop.run_in_executor(executor, run_edgespeak, sentence, speaker, filename)
-                tasks.append(task)
-        await asyncio.gather(*tasks)
+async def parallel_edgespeak(sentences, speakers, filenames, failed_sentences):
+    semaphore = asyncio.Semaphore(5) # Keeps Azure from IP-banning you
+    
+    async def bounded_edgespeak(sentence, speaker, filename):
+        async with semaphore:
+            sentence = re.sub(r'[!]+', '!', sentence)
+            sentence = re.sub(r'[?]+', '?', sentence)
+            await run_edgespeak(sentence, speaker, filename, failed_sentences)
+
+    tasks = [
+        bounded_edgespeak(sentence, speaker, filename) 
+        for sentence, speaker, filename in zip(sentences, speakers, filenames)
+    ]
+    await asyncio.gather(*tasks)
 
 def main():
     parser = argparse.ArgumentParser(prog="epub2tts-edge")
@@ -456,11 +467,27 @@ def main():
         exit()
 
     book_contents, book_title, book_author, chapter_titles = get_book(args.sourcefile, encoding=args.encoding)
-    files = read_book(book_contents, args.speaker, args.paragraphpause, args.sentencepause)
+    
+    # Initialize the tracking list
+    failed_sentences = []
+    
+    files = read_book(book_contents, args.speaker, args.paragraphpause, args.sentencepause, failed_sentences)
     generate_metadata(files, book_author, book_title, chapter_titles)
     
     final_file = make_audiobook(files, args.sourcefile, args.speaker, args.codec, args.bitrate, args.cover)
     print(f"Done! File saved as: {final_file}")
+
+    # Courtesy Summary printed at the very end
+    if failed_sentences:
+        print("\n" + "="*80)
+        print("⚠️  CONVERSION COMPLETED, BUT SOME SENTENCES FAILED ⚠️")
+        print("The following text triggered engine errors and was replaced with silence:")
+        print("-" * 80)
+        for i, sentence in enumerate(failed_sentences, 1):
+            print(f"{i}. {sentence}")
+        print("="*80 + "\n")
+    else:
+        print("\n✅ CONVERSION 100% SUCCESSFUL! No sentences were dropped.\n")
 
 if __name__ == "__main__":
     main()
